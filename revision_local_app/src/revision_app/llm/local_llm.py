@@ -170,11 +170,80 @@ class LocalLLMClient:
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if s.strip()]
         return "\n".join(f"- {s}" for s in sentences[:8]) or "- No notes generated."
 
+    def _is_generic_filler(self, text: str) -> bool:
+        """Check if text is generic filler vs meaningful content."""
+        generic_patterns = [
+            r"^(thank you|thanks|questions\?|any questions|more information|learn more)",
+            r"(visit|click|see|check|refer to).{0,30}(website|link|page|below|above)",
+            r"^(for more|for further|for additional|to learn|to find).{0,30}(information|details|knowledge)",
+            r"^(this (is|was|will be|can be))?\s*(slide|page|presentation|document|image)",
+            r"^(contact|email|phone|reach out|get in touch)",
+            r"^(continued|conclusion|summary|overview|introduction|background)",
+        ]
+        lower_text = text.lower()
+        return any(re.search(pattern, lower_text) for pattern in generic_patterns)
+
+    def _score_sentence_relevance(self, text: str, topic: str) -> float:
+        """Score how relevant/specific a sentence is (0-100)."""
+        score = 0.0
+        lower_text = text.lower()
+        
+        # Penalty for generic filler
+        if self._is_generic_filler(text):
+            return -999
+        
+        # Bonus for numbers, formulas, percentages
+        if re.search(r'\d+\.?\d*', text):
+            score += 15
+        
+        # Bonus for technical terms and symbols
+        if re.search(r'[A-Z]{2,}|[A-Z]\w+\([^)]*\)|°|μ|Ω|°C|%|±', text):
+            score += 20
+        
+        # Bonus for definition patterns
+        if re.search(r'\b(is|are|defined as|means|refers to|indicates|represents)\b', lower_text):
+            score += 15
+        
+        # Bonus for causal/explanatory patterns
+        if re.search(r'\b(because|therefore|thus|causes|results in|leads to|results from|due to)\b', lower_text):
+            score += 10
+        
+        # Bonus for listing/enumeration
+        if re.search(r'(^|\W)(and|or|includes|comprises|consists of)', lower_text):
+            score += 8
+        
+        # Bonus for action verbs (specific information)
+        action_verbs = [
+            'calculate', 'determine', 'measure', 'analyze', 'evaluate', 'identify',
+            'compare', 'contrast', 'apply', 'implement', 'convert', 'transform',
+            'increase', 'decrease', 'improve', 'affect', 'influence', 'control'
+        ]
+        if any(f'\\b{verb}' in lower_text for verb in action_verbs):
+            score += 12
+        
+        # Bonus for topic relevance
+        topic_words = {w.lower() for w in topic.split() if len(w) > 2}
+        topic_match = sum(1 for word in topic_words if word in lower_text)
+        score += topic_match * 10
+        
+        # Penalty for very short sentences (likely fragment)
+        if len(text) < 25:
+            score -= 5
+        
+        # Penalty for sentences that are just a list of items
+        if text.count(',') > 5:
+            score -= 5
+        
+        return max(0, min(100, score))
+
     def _extract_content_sentences(self, context: str, max_sentences: int = 20) -> list[str]:
-        """Extract sentences from context for quiz generation."""
+        """Extract and rank sentences by relevance for quiz generation."""
         sentences = re.split(r'(?<=[.!?])\s+', context.strip())
         sentences = [s.strip() for s in sentences if len(s.strip()) > 15 and len(s.strip()) < 300]
-        return sentences[:max_sentences]
+        
+        # For now, just filter out generic filler
+        filtered = [s for s in sentences if not self._is_generic_filler(s)]
+        return filtered if filtered else sentences[:max_sentences]
 
     def _build_content_based_quiz(self, topic: str, context: str, total_questions: int) -> dict:
         """Build quiz questions directly from document content instead of LLM generation."""
@@ -201,47 +270,65 @@ class LocalLLMClient:
                 ],
             }
         
+        # Score all sentences by relevance to topic
+        scored_sentences = [(self._score_sentence_relevance(s, topic), i, s) for i, s in enumerate(sentences)]
+        scored_sentences.sort(reverse=True)  # Sort by relevance score descending
+        top_sentences = [s for _, _, s in scored_sentences]
+        
         mcq_count = max(3, min(6, total_questions - 2))
         short_answer_count = total_questions - mcq_count
         
-        # Create MCQ from content
+        # Create MCQ from top-scoring sentences
         mcq_list = []
-        for i in range(min(mcq_count, len(sentences) // 2)):
-            question_source = sentences[i * 2] if i * 2 < len(sentences) else sentences[0]
+        used_indices = set()
+        
+        for idx in range(min(mcq_count, len(top_sentences))):
+            question_source = top_sentences[idx]
+            used_indices.add(idx)
             
             # Create a question from the sentence
-            if len(question_source) > 50:
-                question = question_source[:80] + "?"
+            if len(question_source) > 60:
+                question = question_source[:100] + "?"
                 if not question.endswith("?"):
                     question = question.rsplit(" ", 1)[0] + "?"
             else:
-                question = f"Which statement best describes the concept in '{topic}'?"
+                question = f"Which describes {topic}: {question_source[:50]}?"
             
-            # Gather other sentences as distractors
-            other_sentences = [s for j, s in enumerate(sentences) if j != i * 2][:3]
+            # Gather other high-relevance sentences as distractors
+            other_sentences = [
+                top_sentences[j][:100] 
+                for j in range(len(top_sentences)) 
+                if j not in used_indices and j < idx + 5
+            ][:3]
             
             options = [question_source[:100]]
-            options.extend([s[:100] for s in other_sentences])
+            options.extend(other_sentences)
             while len(options) < 4:
-                options.append(f"A generic concept in {topic}")
+                # Add conceptually related but different options
+                other_topics = [
+                    f"A related but different aspect of engineering",
+                    f"A common misconception about {topic}",
+                    f"An opposite or contrasting principle"
+                ]
+                options.extend(other_topics)
             options = options[:4]
             
             mcq_list.append({
                 "question": question,
                 "options": options,
                 "answer": options[0],
-                "explanation": f"This statement is directly from the {topic} content.",
+                "explanation": f"This is directly stated in the course material about {topic}.",
             })
         
-        # Create short answer from content
+        # Create short answer from top-ranking sentences
         short_answer_list = []
+        guide_sentences = top_sentences[:min(4, len(top_sentences))]
+        answer_guide = " ".join(guide_sentences)[:400] if guide_sentences else f"Focus on key aspects of {topic}"
+        
         for i in range(short_answer_count):
-            guide_sentences = sentences[len(sentences)//3:len(sentences)//3 + 3]
-            answer_guide = " ".join(guide_sentences)[:300] if guide_sentences else f"Focus on key aspects of {topic}"
-            
             short_answer_list.append({
-                "question": f"Explain the key concepts of '{topic}' based on the course material.",
-                "answer_guide": answer_guide or f"Include definitions, examples, and applications of {topic}.",
+                "question": f"Explain the key concepts of {topic}.",
+                "answer_guide": answer_guide or f"Use specific examples and definitions from the material.",
             })
         
         return {
