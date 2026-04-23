@@ -105,22 +105,25 @@ def main() -> None:
     logger = setup_logging(config.logs_dir)
     persisted_settings = load_settings(config)
 
+    def setting(name: str, default):
+        return persisted_settings.get(name, default)
+
     st.set_page_config(page_title="Local Revision Assistant", layout="wide")
     st.title("Local Engineering Revision Assistant")
     st.caption("Offline, low-resource study generation using local GGUF models.")
 
-    _init_state(default_mode=persisted_settings.get("default_mode", "Low"))
+    _init_state(default_mode=setting("default_mode", "Low"))
 
     effective_config = replace(
         config,
-        gguf_model_path=config.models_dir / persisted_settings["gguf_model"],
-        llm_ctx_size=persisted_settings["llm_ctx_size"],
-        llm_max_tokens=persisted_settings["llm_max_tokens"],
-        llm_threads=persisted_settings["llm_threads"],
-        llm_temperature=persisted_settings["llm_temperature"],
-        enable_embeddings=persisted_settings["enable_embeddings"],
-        embedding_model_name=persisted_settings["embedding_model_name"],
-        tesseract_cmd=(persisted_settings["tesseract_cmd"] or None),
+        gguf_model_path=config.models_dir / setting("gguf_model", config.gguf_model_path.name),
+        llm_ctx_size=setting("llm_ctx_size", config.llm_ctx_size),
+        llm_max_tokens=setting("llm_max_tokens", config.llm_max_tokens),
+        llm_threads=setting("llm_threads", config.llm_threads),
+        llm_temperature=setting("llm_temperature", config.llm_temperature),
+        enable_embeddings=setting("enable_embeddings", config.enable_embeddings),
+        embedding_model_name=setting("embedding_model_name", config.embedding_model_name),
+        tesseract_cmd=(setting("tesseract_cmd", "") or None),
     )
 
     llm = _get_llm_client(config=effective_config, _logger=logger)
@@ -134,41 +137,41 @@ def main() -> None:
                 default_mode = st.selectbox(
                     "Default resource mode",
                     options=["Low", "High"],
-                    index=0 if persisted_settings["default_mode"] == "Low" else 1,
+                    index=0 if setting("default_mode", "Low") == "Low" else 1,
                     help="Applied as default each time the app starts.",
                 )
-                gguf_model = st.text_input("GGUF model filename", value=persisted_settings["gguf_model"])
-                llm_ctx_size = st.number_input("LLM context size", min_value=512, max_value=4096, value=int(persisted_settings["llm_ctx_size"]), step=128)
-                llm_max_tokens = st.number_input("LLM max tokens", min_value=64, max_value=1024, value=int(persisted_settings["llm_max_tokens"]), step=32)
-                llm_threads = st.number_input("LLM CPU threads", min_value=1, max_value=32, value=int(persisted_settings["llm_threads"]), step=1)
-                llm_temperature = st.slider("LLM temperature", min_value=0.0, max_value=1.2, value=float(persisted_settings["llm_temperature"]), step=0.05)
-                enable_embeddings = st.checkbox("Enable embedding topic merge", value=bool(persisted_settings["enable_embeddings"]))
-                embedding_model_name = st.text_input("Embedding model", value=persisted_settings["embedding_model_name"])
-                tesseract_cmd = st.text_input("Tesseract command path (optional)", value=persisted_settings["tesseract_cmd"])
+                gguf_model = st.text_input("GGUF model filename", value=setting("gguf_model", config.gguf_model_path.name))
+                llm_ctx_size = st.number_input("LLM context size", min_value=512, max_value=4096, value=int(setting("llm_ctx_size", config.llm_ctx_size)), step=128)
+                llm_max_tokens = st.number_input("LLM max tokens", min_value=64, max_value=1024, value=int(setting("llm_max_tokens", config.llm_max_tokens)), step=32)
+                llm_threads = st.number_input("LLM CPU threads", min_value=1, max_value=32, value=int(setting("llm_threads", config.llm_threads)), step=1)
+                llm_temperature = st.slider("LLM temperature", min_value=0.0, max_value=1.2, value=float(setting("llm_temperature", config.llm_temperature)), step=0.05)
+                enable_embeddings = st.checkbox("Enable embedding topic merge", value=bool(setting("enable_embeddings", config.enable_embeddings)))
+                embedding_model_name = st.text_input("Embedding model", value=setting("embedding_model_name", config.embedding_model_name))
+                tesseract_cmd = st.text_input("Tesseract command path (optional)", value=setting("tesseract_cmd", ""))
                 allow_web_browsing = st.checkbox(
                     "Allow trusted internet sources in Q&A",
-                    value=bool(persisted_settings["allow_web_browsing"]),
+                    value=bool(setting("allow_web_browsing", False)),
                     help="When enabled, document Q&A can augment context from trusted web domains.",
                 )
                 trusted_domains = st.text_input(
                     "Trusted domains (comma-separated)",
-                    value=persisted_settings["trusted_domains"],
+                    value=setting("trusted_domains", "wikipedia.org,nist.gov,nasa.gov,asme.org,ieee.org,mit.edu"),
                     help="Only these domains are used for web augmentation.",
                 )
                 trusted_urls = st.text_area(
                     "Optional trusted URLs (comma-separated)",
-                    value=persisted_settings["trusted_urls"],
+                    value=setting("trusted_urls", ""),
                     height=70,
                     help="Provide specific trusted pages to use during Q&A.",
                 )
 
                 low_col, high_col = st.columns(2)
                 with low_col:
-                    max_topics_low = st.number_input("Low: max topics", min_value=3, max_value=12, value=int(persisted_settings["max_topics_low"]), step=1)
-                    quiz_per_topic_low = st.number_input("Low: quiz questions/topic", min_value=5, max_value=10, value=int(persisted_settings["quiz_per_topic_low"]), step=1)
+                    max_topics_low = st.number_input("Low: max topics", min_value=3, max_value=12, value=int(setting("max_topics_low", 6)), step=1)
+                    quiz_per_topic_low = st.number_input("Low: quiz questions/topic", min_value=5, max_value=10, value=int(setting("quiz_per_topic_low", 6)), step=1)
                 with high_col:
-                    max_topics_high = st.number_input("High: max topics", min_value=3, max_value=12, value=int(persisted_settings["max_topics_high"]), step=1)
-                    quiz_per_topic_high = st.number_input("High: quiz questions/topic", min_value=5, max_value=10, value=int(persisted_settings["quiz_per_topic_high"]), step=1)
+                    max_topics_high = st.number_input("High: max topics", min_value=3, max_value=12, value=int(setting("max_topics_high", 10)), step=1)
+                    quiz_per_topic_high = st.number_input("High: quiz questions/topic", min_value=5, max_value=10, value=int(setting("quiz_per_topic_high", 8)), step=1)
 
                 save_clicked = st.form_submit_button("Save Settings", type="primary")
                 reset_clicked = st.form_submit_button("Reset to Defaults")
@@ -223,14 +226,14 @@ def main() -> None:
     if mode == "Low":
         runtime_config = replace(
             effective_config,
-            max_topics=min(effective_config.max_topics, persisted_settings["max_topics_low"]),
-            quiz_questions_per_topic=min(effective_config.quiz_questions_per_topic, persisted_settings["quiz_per_topic_low"]),
+            max_topics=min(effective_config.max_topics, setting("max_topics_low", 6)),
+            quiz_questions_per_topic=min(effective_config.quiz_questions_per_topic, setting("quiz_per_topic_low", 6)),
         )
     else:
         runtime_config = replace(
             effective_config,
-            max_topics=max(effective_config.max_topics, persisted_settings["max_topics_high"]),
-            quiz_questions_per_topic=max(effective_config.quiz_questions_per_topic, persisted_settings["quiz_per_topic_high"]),
+            max_topics=max(effective_config.max_topics, setting("max_topics_high", 10)),
+            quiz_questions_per_topic=max(effective_config.quiz_questions_per_topic, setting("quiz_per_topic_high", 8)),
         )
 
     uploads = st.file_uploader(
@@ -310,11 +313,11 @@ def main() -> None:
             else:
                 context, sources = _build_qa_context(result.raw_documents, question)
                 web_entries: list[dict] = []
-                if persisted_settings.get("allow_web_browsing", False):
+                if setting("allow_web_browsing", False):
                     web_entries = gather_trusted_web_context(
                         question=question,
-                        user_urls=_parse_csv_values(persisted_settings.get("trusted_urls", "")),
-                        extra_domains=_parse_csv_values(persisted_settings.get("trusted_domains", "")),
+                        user_urls=_parse_csv_values(setting("trusted_urls", "")),
+                        extra_domains=_parse_csv_values(setting("trusted_domains", "")),
                         max_sources=3,
                     )
                     if web_entries:
