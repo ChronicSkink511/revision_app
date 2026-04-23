@@ -32,7 +32,14 @@ def default_settings(config: AppConfig) -> dict:
 
 
 
-def settings_path(config: AppConfig) -> Path:
+def settings_path(config: AppConfig, user_settings_path: Path | None = None) -> Path:
+    """Get settings file path.
+    
+    If user_settings_path is provided (user-specific), use that.
+    Otherwise fall back to global work_dir for backward compatibility.
+    """
+    if user_settings_path is not None:
+        return user_settings_path
     return config.work_dir / SETTINGS_FILENAME
 
 
@@ -81,9 +88,18 @@ def normalize_settings(raw: dict, defaults: dict) -> dict:
 
 
 
-def load_settings(config: AppConfig) -> dict:
+def load_settings(config: AppConfig, user_settings_path: Path | None = None) -> dict:
+    """Load settings, preferring user-specific path if provided.
+    
+    Args:
+        config: App configuration
+        user_settings_path: User-specific settings file path (for isolation)
+        
+    Returns:
+        Settings dictionary (user-specific if path provided, global otherwise)
+    """
     defaults = default_settings(config)
-    path = settings_path(config)
+    path = settings_path(config, user_settings_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if not path.exists():
@@ -99,10 +115,20 @@ def load_settings(config: AppConfig) -> dict:
 
 
 
-def save_settings(config: AppConfig, settings: dict) -> dict:
+def save_settings(config: AppConfig, settings: dict, user_settings_path: Path | None = None) -> dict:
+    """Save settings, preferring user-specific path if provided.
+    
+    Args:
+        config: App configuration
+        settings: Settings to save
+        user_settings_path: User-specific settings file path (for isolation)
+        
+    Returns:
+        Normalized settings dictionary
+    """
     defaults = default_settings(config)
     normalized = normalize_settings(settings, defaults)
-    path = settings_path(config)
+    path = settings_path(config, user_settings_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(normalized, indent=2), encoding="utf-8")
     return normalized

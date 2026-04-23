@@ -20,29 +20,32 @@ from revision_app.llm import LocalLLMClient
 from revision_app.logging_utils import setup_logging
 from revision_app.parsing import parse_documents
 from revision_app.settings_store import load_settings, save_settings
+from revision_app.user_session import init_user_session_state, get_user_uploads_dir, get_user_work_dir, get_user_settings_path, get_current_user_id
 from revision_app.web import gather_trusted_web_context
 
 
-def _init_state(default_mode: str):
-    if "analysis_result" not in st.session_state:
-        st.session_state.analysis_result = None
-    if "warnings" not in st.session_state:
-        st.session_state.warnings = []
-    if "exports" not in st.session_state:
-        st.session_state.exports = {}
-    if "runtime_mode" not in st.session_state:
-        st.session_state.runtime_mode = default_mode if default_mode in {"Low", "High"} else "Low"
-    if "qa_question" not in st.session_state:
-        st.session_state.qa_question = ""
-    if "qa_answer" not in st.session_state:
-        st.session_state.qa_answer = ""
-    if "qa_sources" not in st.session_state:
-        st.session_state.qa_sources = []
-    if "qa_web_snippets" not in st.session_state:
-        st.session_state.qa_web_snippets = []
+def main() -> None:
+    ensure_project_tree()
+    config = load_config(PROJECT_ROOT)
+    
+    # Initialize user isolation FIRST - before any file operations
+    init_user_session_state()
+    user_id = get_current_user_id()
+    
+    # Get user-specific directories and settings path
+    user_uploads_dir = get_user_uploads_dir(config)
+    user_work_dir = get_user_work_dir(config)
+    user_settings_path = get_user_settings_path(config)
+    
+    logger = setup_logging(user_work_dir / "logs")
+    persisted_settings = load_settings(config, user_settings_path)
 
+    def setting(name: str, default):
+        return persisted_settings.get(name, default)
 
-def _build_qa_context(documents, question: str, max_chars: int = 3600) -> tuple[str, list[str]]:
+    st.set_page_config(page_title="Local Revision Assistant", layout="wide")
+    st.title("Local Engineering Revision Assistant")
+    st.caption("Offline, low-resource study generation using local GGUF models.")
     tokens = {w.lower() for w in re.findall(r"[A-Za-z0-9_+-]{3,}", question)}
     chunks: list[tuple[int, str, str]] = []
 
@@ -197,6 +200,7 @@ def main() -> None:
                         "max_topics_high": max_topics_high,
                         "quiz_per_topic_high": quiz_per_topic_high,
                     },
+                    user_settings_path,  # Use user-specific settings path
                 )
                 st.session_state.runtime_mode = saved["default_mode"]
                 _get_llm_client.clear()
@@ -205,7 +209,7 @@ def main() -> None:
                 st.rerun()
 
             if reset_clicked:
-                saved = save_settings(config, {})
+                saved = save_settings(config, {}, user_settings_path)  # Use user-specific settings path
                 st.session_state.runtime_mode = saved["default_mode"]
                 _get_llm_client.clear()
                 _get_image_analyzer.clear()
@@ -247,7 +251,8 @@ def main() -> None:
             st.warning("Please upload at least one file.")
         else:
             with st.spinner("Ingesting and analyzing files..."):
-                persisted, ingest_warnings = ingest_uploaded_files(uploads, config.uploads_dir, logger)
+                # Use user-specific uploads directory for complete data isolation
+                persisted, ingest_warnings = ingest_uploaded_files(uploads, user_uploads_dir, logger)
 
                 documents, parse_warnings = parse_documents(persisted, image_analyzer, logger)
 
