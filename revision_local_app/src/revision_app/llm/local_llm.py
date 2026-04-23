@@ -228,3 +228,29 @@ class LocalLLMClient:
             f"- Estimated line count: {vision_features.get('line_count', 0)}\n"
             f"- Estimated contour count: {vision_features.get('contour_count', 0)}"
         )
+
+    def answer_question(self, question: str, context: str) -> str:
+        prompt = (
+            "Answer the question using only the provided context. "
+            "If the context is insufficient, say what is missing. Be concise and accurate.\n"
+            f"Question: {question}\n"
+            f"Context:\n{context[:3800]}"
+        )
+        response = self._generate(prompt, max_tokens=280)
+        if response:
+            return response
+
+        tokens = {w.lower() for w in re.findall(r"[A-Za-z0-9_+-]{3,}", question)}
+        lines = [ln.strip() for ln in context.splitlines() if ln.strip()]
+        ranked: list[tuple[int, str]] = []
+        for line in lines:
+            score = sum(1 for t in tokens if t in line.lower())
+            if score > 0:
+                ranked.append((score, line))
+
+        if not ranked:
+            return "I could not find enough evidence in the extracted documents to answer this reliably."
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        top_lines = [line for _, line in ranked[:4]]
+        return "\n".join(f"- {line}" for line in top_lines)

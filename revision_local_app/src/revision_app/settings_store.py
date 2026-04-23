@@ -25,6 +25,9 @@ def default_settings(config: AppConfig) -> dict:
         "quiz_per_topic_low": 6,
         "max_topics_high": 10,
         "quiz_per_topic_high": 8,
+        "allow_web_browsing": False,
+        "trusted_domains": "wikipedia.org,nist.gov,nasa.gov,asme.org,ieee.org,mit.edu",
+        "trusted_urls": "",
     }
 
 
@@ -69,6 +72,9 @@ def normalize_settings(raw: dict, defaults: dict) -> dict:
         "quiz_per_topic_low": _clamp_int(raw.get("quiz_per_topic_low"), 5, 10, defaults["quiz_per_topic_low"]),
         "max_topics_high": _clamp_int(raw.get("max_topics_high"), 3, 12, defaults["max_topics_high"]),
         "quiz_per_topic_high": _clamp_int(raw.get("quiz_per_topic_high"), 5, 10, defaults["quiz_per_topic_high"]),
+        "allow_web_browsing": bool(raw.get("allow_web_browsing", defaults["allow_web_browsing"])),
+        "trusted_domains": str(raw.get("trusted_domains", defaults["trusted_domains"]))[:400],
+        "trusted_urls": str(raw.get("trusted_urls", defaults["trusted_urls"]))[:1200],
     }
 
     return normalized

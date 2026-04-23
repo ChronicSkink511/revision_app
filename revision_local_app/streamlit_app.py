@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -19,6 +20,7 @@ from revision_app.llm import LocalLLMClient
 from revision_app.logging_utils import setup_logging
 from revision_app.parsing import parse_documents
 from revision_app.settings_store import load_settings, save_settings
+from revision_app.web import gather_trusted_web_context
 
 
 def _init_state(default_mode: str):
@@ -30,6 +32,56 @@ def _init_state(default_mode: str):
         st.session_state.exports = {}
     if "runtime_mode" not in st.session_state:
         st.session_state.runtime_mode = default_mode if default_mode in {"Low", "High"} else "Low"
+    if "qa_question" not in st.session_state:
+        st.session_state.qa_question = ""
+    if "qa_answer" not in st.session_state:
+        st.session_state.qa_answer = ""
+    if "qa_sources" not in st.session_state:
+        st.session_state.qa_sources = []
+    if "qa_web_snippets" not in st.session_state:
+        st.session_state.qa_web_snippets = []
+
+
+def _build_qa_context(documents, question: str, max_chars: int = 3600) -> tuple[str, list[str]]:
+    tokens = {w.lower() for w in re.findall(r"[A-Za-z0-9_+-]{3,}", question)}
+    chunks: list[tuple[int, str, str]] = []
+
+    for doc in documents:
+        source = doc.source_path.name
+        for segment in doc.text.splitlines():
+            line = segment.strip()
+            if not line:
+                continue
+            score = sum(1 for t in tokens if t in line.lower())
+            if score > 0:
+                chunks.append((score, source, line))
+
+    if not chunks:
+        fallback_text = "\n\n".join(doc.text[:700] for doc in documents[:4])
+        fallback_sources = [doc.source_path.name for doc in documents[:4]]
+        return fallback_text[:max_chars], fallback_sources
+
+    chunks.sort(key=lambda x: x[0], reverse=True)
+    selected: list[str] = []
+    sources: list[str] = []
+    used_chars = 0
+
+    for _, source, line in chunks:
+        addition = f"[{source}] {line}"
+        if used_chars + len(addition) + 1 > max_chars:
+            break
+        selected.append(addition)
+        used_chars += len(addition) + 1
+        if source not in sources:
+            sources.append(source)
+        if len(selected) >= 14:
+            break
+
+    return "\n".join(selected), sources
+
+
+def _parse_csv_values(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 @st.cache_resource(show_spinner=False)
@@ -93,6 +145,22 @@ def main() -> None:
                 enable_embeddings = st.checkbox("Enable embedding topic merge", value=bool(persisted_settings["enable_embeddings"]))
                 embedding_model_name = st.text_input("Embedding model", value=persisted_settings["embedding_model_name"])
                 tesseract_cmd = st.text_input("Tesseract command path (optional)", value=persisted_settings["tesseract_cmd"])
+                allow_web_browsing = st.checkbox(
+                    "Allow trusted internet sources in Q&A",
+                    value=bool(persisted_settings["allow_web_browsing"]),
+                    help="When enabled, document Q&A can augment context from trusted web domains.",
+                )
+                trusted_domains = st.text_input(
+                    "Trusted domains (comma-separated)",
+                    value=persisted_settings["trusted_domains"],
+                    help="Only these domains are used for web augmentation.",
+                )
+                trusted_urls = st.text_area(
+                    "Optional trusted URLs (comma-separated)",
+                    value=persisted_settings["trusted_urls"],
+                    height=70,
+                    help="Provide specific trusted pages to use during Q&A.",
+                )
 
                 low_col, high_col = st.columns(2)
                 with low_col:
@@ -118,6 +186,9 @@ def main() -> None:
                         "enable_embeddings": enable_embeddings,
                         "embedding_model_name": embedding_model_name,
                         "tesseract_cmd": tesseract_cmd,
+                        "allow_web_browsing": allow_web_browsing,
+                        "trusted_domains": trusted_domains,
+                        "trusted_urls": trusted_urls,
                         "max_topics_low": max_topics_low,
                         "quiz_per_topic_low": quiz_per_topic_low,
                         "max_topics_high": max_topics_high,
@@ -220,6 +291,67 @@ def main() -> None:
                     st.write(f"{q_idx}. {q.get('question', '')}")
                     with st.expander(f"Reveal guide {q_idx}"):
                         st.write(q.get("answer_guide", ""))
+
+        st.subheader("Ask Documents")
+        with st.form("qa_form"):
+            question = st.text_input(
+                "Ask a question about your uploaded documents/slides",
+                value=st.session_state.qa_question,
+                placeholder="Example: What assumptions are stated in the simulation slides?",
+            )
+            ask_clicked = st.form_submit_button("Ask")
+
+        if ask_clicked:
+            st.session_state.qa_question = question
+            if not question.strip():
+                st.session_state.qa_answer = "Please enter a question."
+                st.session_state.qa_sources = []
+                st.session_state.qa_web_snippets = []
+            else:
+                context, sources = _build_qa_context(result.raw_documents, question)
+                web_entries: list[dict] = []
+                if persisted_settings.get("allow_web_browsing", False):
+                    web_entries = gather_trusted_web_context(
+                        question=question,
+                        user_urls=_parse_csv_values(persisted_settings.get("trusted_urls", "")),
+                        extra_domains=_parse_csv_values(persisted_settings.get("trusted_domains", "")),
+                        max_sources=3,
+                    )
+                    if web_entries:
+                        web_context = "\n".join(f"[WEB:{item['source']}] {item['text']}" for item in web_entries)
+                        context = (context + "\n\n" + web_context).strip()[:5000]
+                        sources.extend(item["source"] for item in web_entries)
+                st.session_state.qa_answer = llm.answer_question(question, context)
+                deduped_sources = []
+                seen = set()
+                for src in sources:
+                    if src not in seen:
+                        seen.add(src)
+                        deduped_sources.append(src)
+                st.session_state.qa_sources = deduped_sources
+                st.session_state.qa_web_snippets = web_entries
+
+        if st.session_state.qa_answer:
+            using_web = len(st.session_state.qa_web_snippets) > 0
+            if using_web:
+                st.info("Answer mode: Local documents + trusted web sources")
+            else:
+                st.info("Answer mode: Local documents only")
+
+            st.markdown("**Answer**")
+            st.markdown(st.session_state.qa_answer)
+
+            if using_web:
+                st.markdown("**Trusted Web Evidence Used (bold text)**")
+                for item in st.session_state.qa_web_snippets:
+                    src = item.get("source", "unknown source")
+                    txt = (item.get("text", "") or "").strip()
+                    st.markdown(f"- **Source:** {src}")
+                    if txt:
+                        st.markdown(f"**{txt[:420]}**")
+
+            if st.session_state.qa_sources:
+                st.caption("Sources: " + ", ".join(st.session_state.qa_sources))
 
         st.subheader("Export")
         export_col1, export_col2, export_col3, export_col4 = st.columns(4)
