@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "C:/Users/tchri/AppData/Local/Programs/Python/Python311/python.exe",
+  "python.analysis.extraPaths": [
+    "revision_local_app/src",
+    "revision_local_app"
+  ],
+  "python.analysis.autoImportCompletions": true
+}

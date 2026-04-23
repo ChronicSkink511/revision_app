@@ -1,0 +1,26 @@
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# Streamlit and logs
+.streamlit/
+revision_local_app/logs/
+
+# App runtime data
+revision_local_app/data/uploads/
+revision_local_app/data/work/
+revision_local_app/data/models/
+
+# Local deployment artifacts
+*.log
