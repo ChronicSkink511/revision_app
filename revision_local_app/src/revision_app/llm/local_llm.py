@@ -170,44 +170,112 @@ class LocalLLMClient:
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if s.strip()]
         return "\n".join(f"- {s}" for s in sentences[:8]) or "- No notes generated."
 
+    def _extract_content_sentences(self, context: str, max_sentences: int = 20) -> list[str]:
+        """Extract sentences from context for quiz generation."""
+        sentences = re.split(r'(?<=[.!?])\s+', context.strip())
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 15 and len(s.strip()) < 300]
+        return sentences[:max_sentences]
+
+    def _build_content_based_quiz(self, topic: str, context: str, total_questions: int) -> dict:
+        """Build quiz questions directly from document content instead of LLM generation."""
+        sentences = self._extract_content_sentences(context, max_sentences=25)
+        
+        if not sentences:
+            # Ultimate fallback - at least include topic name meaningfully
+            return {
+                "mcq": [
+                    {
+                        "question": f"What is the primary focus of '{topic}'?",
+                        "options": [f"Study of {topic}", "Unrelated historical fact", "Random biological concept", "Non-technical opinion"],
+                        "answer": f"Study of {topic}",
+                        "explanation": "This question directly addresses the topic content.",
+                    }
+                    for _ in range(max(3, min(5, total_questions - 2)))
+                ],
+                "short_answer": [
+                    {
+                        "question": f"Define '{topic}' in your own words.",
+                        "answer_guide": f"Include key characteristics, principles, and applications of {topic}.",
+                    }
+                    for _ in range(min(2, total_questions - 3))
+                ],
+            }
+        
+        mcq_count = max(3, min(6, total_questions - 2))
+        short_answer_count = total_questions - mcq_count
+        
+        # Create MCQ from content
+        mcq_list = []
+        for i in range(min(mcq_count, len(sentences) // 2)):
+            question_source = sentences[i * 2] if i * 2 < len(sentences) else sentences[0]
+            
+            # Create a question from the sentence
+            if len(question_source) > 50:
+                question = question_source[:80] + "?"
+                if not question.endswith("?"):
+                    question = question.rsplit(" ", 1)[0] + "?"
+            else:
+                question = f"Which statement best describes the concept in '{topic}'?"
+            
+            # Gather other sentences as distractors
+            other_sentences = [s for j, s in enumerate(sentences) if j != i * 2][:3]
+            
+            options = [question_source[:100]]
+            options.extend([s[:100] for s in other_sentences])
+            while len(options) < 4:
+                options.append(f"A generic concept in {topic}")
+            options = options[:4]
+            
+            mcq_list.append({
+                "question": question,
+                "options": options,
+                "answer": options[0],
+                "explanation": f"This statement is directly from the {topic} content.",
+            })
+        
+        # Create short answer from content
+        short_answer_list = []
+        for i in range(short_answer_count):
+            guide_sentences = sentences[len(sentences)//3:len(sentences)//3 + 3]
+            answer_guide = " ".join(guide_sentences)[:300] if guide_sentences else f"Focus on key aspects of {topic}"
+            
+            short_answer_list.append({
+                "question": f"Explain the key concepts of '{topic}' based on the course material.",
+                "answer_guide": answer_guide or f"Include definitions, examples, and applications of {topic}.",
+            })
+        
+        return {
+            "mcq": mcq_list,
+            "short_answer": short_answer_list,
+        }
+
     def generate_quiz(self, topic: str, context: str, total_questions: int = 8) -> dict:
+        # Improved prompt with simpler JSON structure
         prompt = (
-            "Return ONLY valid JSON object with keys mcq and short_answer. "
-            "mcq is list of objects with question, options(list of 4), answer, explanation. "
-            "short_answer is list of objects with question, answer_guide. "
-            f"Create {max(5, min(10, total_questions))} total questions for topic {topic}.\n"
-            f"Context:\n{context[:3500]}"
+            f"Topic: {topic}\n"
+            "Generate 3 multiple choice questions (each with exactly 4 options labeled A, B, C, D) "
+            "and 2 short answer questions about the content below.\n"
+            "Return as JSON with mcq array and short_answer array.\n"
+            "Each MCQ object must have: question, options (array of 4), answer (single letter), explanation.\n"
+            "Each short answer must have: question, answer_guide.\n\n"
+            f"Content:\n{context[:4000]}"
         )
 
-        raw = self._generate(prompt, max_tokens=420)
+        raw = self._generate(prompt, max_tokens=500)
+        self.logger.debug(f"Quiz generation raw output (first 200 chars): {raw[:200]}")
+        
         parsed = self._extract_json(raw)
 
         if isinstance(parsed, dict) and "mcq" in parsed and "short_answer" in parsed:
-            return parsed
+            # Validate the structure
+            if isinstance(parsed.get("mcq"), list) and isinstance(parsed.get("short_answer"), list):
+                return parsed
+            self.logger.warning("Quiz JSON structure invalid; using content-based fallback")
+        else:
+            self.logger.warning("Quiz JSON parsing failed; using content-based fallback")
 
-        return {
-            "mcq": [
-                {
-                    "question": f"Which statement best matches {topic}?",
-                    "options": [
-                        "A core definition from the notes",
-                        "An unrelated historical fact",
-                        "A random biological concept",
-                        "A non-technical opinion",
-                    ],
-                    "answer": "A core definition from the notes",
-                    "explanation": "The correct choice aligns with the topic context.",
-                }
-                for _ in range(5)
-            ],
-            "short_answer": [
-                {
-                    "question": f"Explain one key engineering principle in {topic}.",
-                    "answer_guide": "Mention a principle, supporting formula/diagram logic, and practical implication.",
-                }
-                for _ in range(3)
-            ],
-        }
+        # Use content-based quiz when LLM generation fails
+        return self._build_content_based_quiz(topic, context, total_questions)
 
     def interpret_engineering_image(self, image_path: str, ocr_text: str, vision_features: dict) -> str:
         prompt = (

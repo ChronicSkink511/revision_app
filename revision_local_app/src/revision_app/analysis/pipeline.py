@@ -9,20 +9,23 @@ from revision_app.schemas import AnalysisResult, TopicBundle
 
 
 
-def _build_topic_context(topic: str, docs_text: list[str], max_context_chars: int = 3200) -> str:
+def _build_topic_context(topic: str, docs_text: list[str], max_context_chars: int = 5000) -> str:
     topic_words = {w.lower() for w in topic.split() if len(w) > 2}
     selected: list[str] = []
 
+    # First pass: find sections explicitly mentioning topic words
     for chunk in docs_text:
         low = chunk.lower()
         if any(word in low for word in topic_words):
-            selected.append(chunk[:1000])
-        if len(selected) >= 4:
+            selected.append(chunk)
+        if len(selected) >= 6:
             break
 
+    # If no topic matches found, use all available content
     if not selected:
-        selected = docs_text[:3]
+        selected = docs_text[:5]
 
+    # Increase context by using more content per chunk
     return "\n\n".join(selected)[:max_context_chars]
 
 
@@ -39,13 +42,14 @@ def run_analysis(documents, llm_client, config, logger: logging.Logger) -> Analy
         max_topics=max(3, min(12, config.max_topics)),
     )
 
-    docs_text = [doc.text[:3000] for doc in documents if doc.text]
+    # Use more content per document for better context
+    docs_text = [doc.text[:6000] for doc in documents if doc.text]
     bundles: list[TopicBundle] = []
 
     for t in topics:
         topic_name = str(t.get("topic", "General Topic")).strip() or "General Topic"
         evidence = str(t.get("evidence", "Detected from corpus"))
-        context = _build_topic_context(topic_name, docs_text, max_context_chars=3200)
+        context = _build_topic_context(topic_name, docs_text, max_context_chars=5000)
 
         notes = generate_notes(topic=topic_name, context=context, llm_client=llm_client)
         quiz = generate_quiz(
