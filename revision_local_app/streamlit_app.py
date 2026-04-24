@@ -20,33 +20,43 @@ from revision_app.llm import LocalLLMClient
 from revision_app.logging_utils import setup_logging
 from revision_app.parsing import parse_documents
 from revision_app.settings_store import load_settings, save_settings
-from revision_app.user_session import init_user_session_state, get_user_uploads_dir, get_user_work_dir, get_user_settings_path, get_current_user_id
+from revision_app.user_session import (
+    get_current_user_id,
+    get_user_settings_path,
+    get_user_uploads_dir,
+    get_user_work_dir,
+    init_user_session_state,
+)
 from revision_app.web import gather_trusted_web_context
 
 
-def main() -> None:
-    ensure_project_tree()
-    config = load_config(PROJECT_ROOT)
-    
-    # Initialize user isolation FIRST - before any file operations
-    init_user_session_state()
-    user_id = get_current_user_id()
-    
-    # Get user-specific directories and settings path
-    user_uploads_dir = get_user_uploads_dir(config)
-    user_work_dir = get_user_work_dir(config)
-    user_settings_path = get_user_settings_path(config)
-    
-    logger = setup_logging(user_work_dir / "logs")
-    persisted_settings = load_settings(config, user_settings_path)
+def _parse_csv_values(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
-    def setting(name: str, default):
-        return persisted_settings.get(name, default)
 
-    st.set_page_config(page_title="Local Revision Assistant", layout="wide")
-    st.title("Local Engineering Revision Assistant")
-    st.caption("Offline, low-resource study generation using local GGUF models.")
-    tokens = {w.lower() for w in re.findall(r"[A-Za-z0-9_+-]{3,}", question)}
+def _init_state(default_mode: str = "Low") -> None:
+    if "analysis_result" not in st.session_state:
+        st.session_state.analysis_result = None
+    if "warnings" not in st.session_state:
+        st.session_state.warnings = []
+    if "exports" not in st.session_state:
+        st.session_state.exports = {}
+    if "runtime_mode" not in st.session_state:
+        st.session_state.runtime_mode = default_mode
+    elif st.session_state.runtime_mode not in {"Low", "High"}:
+        st.session_state.runtime_mode = default_mode
+    if "qa_question" not in st.session_state:
+        st.session_state.qa_question = ""
+    if "qa_answer" not in st.session_state:
+        st.session_state.qa_answer = ""
+    if "qa_sources" not in st.session_state:
+        st.session_state.qa_sources = []
+    if "qa_web_snippets" not in st.session_state:
+        st.session_state.qa_web_snippets = []
+
+
+def _build_qa_context(documents, question: str, max_chars: int = 5000) -> tuple[str, list[str]]:
+    tokens = {word.lower() for word in re.findall(r"[A-Za-z0-9_+-]{3,}", question)}
     chunks: list[tuple[int, str, str]] = []
 
     for doc in documents:
@@ -55,16 +65,17 @@ def main() -> None:
             line = segment.strip()
             if not line:
                 continue
-            score = sum(1 for t in tokens if t in line.lower())
+            score = sum(1 for token in tokens if token in line.lower())
             if score > 0:
                 chunks.append((score, source, line))
 
     if not chunks:
-        fallback_text = "\n\n".join(doc.text[:700] for doc in documents[:4])
-        fallback_sources = [doc.source_path.name for doc in documents[:4]]
+        fallback_docs = documents[:4]
+        fallback_text = "\n\n".join(doc.text[:700] for doc in fallback_docs if doc.text)
+        fallback_sources = [doc.source_path.name for doc in fallback_docs]
         return fallback_text[:max_chars], fallback_sources
 
-    chunks.sort(key=lambda x: x[0], reverse=True)
+    chunks.sort(key=lambda item: item[0], reverse=True)
     selected: list[str] = []
     sources: list[str] = []
     used_chars = 0
@@ -83,10 +94,6 @@ def main() -> None:
     return "\n".join(selected), sources
 
 
-def _parse_csv_values(raw: str) -> list[str]:
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
 @st.cache_resource(show_spinner=False)
 def _get_llm_client(config, _logger):
     return LocalLLMClient(config=config, logger=_logger)
@@ -101,20 +108,26 @@ def _get_image_analyzer(_llm_client, _logger, tesseract_cmd: str | None):
     )
 
 
-
 def main() -> None:
     ensure_project_tree()
     config = load_config(PROJECT_ROOT)
-    logger = setup_logging(config.logs_dir)
-    persisted_settings = load_settings(config)
+
+    st.set_page_config(page_title="Local Revision Assistant", layout="wide")
+
+    init_user_session_state()
+    user_id = get_current_user_id()
+    user_uploads_dir = get_user_uploads_dir(config)
+    user_work_dir = get_user_work_dir(config)
+    user_settings_path = get_user_settings_path(config)
+
+    logger = setup_logging(user_work_dir / "logs")
+    persisted_settings = load_settings(config, user_settings_path)
 
     def setting(name: str, default):
         return persisted_settings.get(name, default)
 
-    st.set_page_config(page_title="Local Revision Assistant", layout="wide")
     st.title("Local Engineering Revision Assistant")
     st.caption("Offline, low-resource study generation using local GGUF models.")
-
     _init_state(default_mode=setting("default_mode", "Low"))
 
     effective_config = replace(
@@ -130,10 +143,15 @@ def main() -> None:
     )
 
     llm = _get_llm_client(config=effective_config, _logger=logger)
-    image_analyzer = _get_image_analyzer(_llm_client=llm, _logger=logger, tesseract_cmd=effective_config.tesseract_cmd)
+    image_analyzer = _get_image_analyzer(
+        _llm_client=llm,
+        _logger=logger,
+        tesseract_cmd=effective_config.tesseract_cmd,
+    )
 
     with st.sidebar:
         st.subheader("Runtime")
+        st.caption(f"Session: {user_id}")
 
         with st.expander("Settings", expanded=True):
             with st.form("settings_form"):
@@ -200,7 +218,7 @@ def main() -> None:
                         "max_topics_high": max_topics_high,
                         "quiz_per_topic_high": quiz_per_topic_high,
                     },
-                    user_settings_path,  # Use user-specific settings path
+                    user_settings_path,
                 )
                 st.session_state.runtime_mode = saved["default_mode"]
                 _get_llm_client.clear()
@@ -209,7 +227,7 @@ def main() -> None:
                 st.rerun()
 
             if reset_clicked:
-                saved = save_settings(config, {}, user_settings_path)  # Use user-specific settings path
+                saved = save_settings(config, {}, user_settings_path)
                 st.session_state.runtime_mode = saved["default_mode"]
                 _get_llm_client.clear()
                 _get_image_analyzer.clear()
@@ -251,9 +269,7 @@ def main() -> None:
             st.warning("Please upload at least one file.")
         else:
             with st.spinner("Ingesting and analyzing files..."):
-                # Use user-specific uploads directory for complete data isolation
                 persisted, ingest_warnings = ingest_uploaded_files(uploads, user_uploads_dir, logger)
-
                 documents, parse_warnings = parse_documents(persisted, image_analyzer, logger)
 
                 if not documents:
@@ -265,16 +281,13 @@ def main() -> None:
                     result = run_analysis(documents, llm_client=llm, config=runtime_config, logger=logger)
                     st.session_state.analysis_result = result
                     st.session_state.warnings = ingest_warnings + parse_warnings + result.warnings
-                    export_cache = {}
-                    for label in ("json", "csv", "docx", "pdf"):
-                        export_cache[label] = export_bundle(result, label)
-                    st.session_state.exports = export_cache
+                    st.session_state.exports = {label: export_bundle(result, label) for label in ("json", "csv", "docx", "pdf")}
 
     warnings = st.session_state.warnings
     if warnings:
         with st.expander("Warnings"):
-            for w in warnings:
-                st.write(f"- {w}")
+            for warning in warnings:
+                st.write(f"- {warning}")
 
     result = st.session_state.analysis_result
     if result:
@@ -330,7 +343,7 @@ def main() -> None:
                         context = (context + "\n\n" + web_context).strip()[:5000]
                         sources.extend(item["source"] for item in web_entries)
                 st.session_state.qa_answer = llm.answer_question(question, context)
-                deduped_sources = []
+                deduped_sources: list[str] = []
                 seen = set()
                 for src in sources:
                     if src not in seen:
