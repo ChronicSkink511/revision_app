@@ -20,7 +20,13 @@ def run(cmd: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedPr
     if completed.stderr:
         print(completed.stderr.strip(), file=sys.stderr)
     if check and completed.returncode != 0:
-        raise RuntimeError(f"Command failed ({completed.returncode}): {' '.join(cmd)}")
+        stderr_text = (completed.stderr or "").strip()
+        stdout_text = (completed.stdout or "").strip()
+        detail = stderr_text or stdout_text
+        message = f"Command failed ({completed.returncode}): {' '.join(cmd)}"
+        if detail:
+            message = f"{message}\n{detail}"
+        raise RuntimeError(message)
     return completed
 
 
@@ -57,6 +63,15 @@ def push(root: Path, branch: str) -> None:
     run(["git", "push", "-u", "origin", branch], root)
 
 
+def _is_non_fast_forward(error: RuntimeError) -> bool:
+    text = str(error).lower()
+    return "non-fast-forward" in text or "failed to push some refs" in text
+
+
+def sync_branch(root: Path, branch: str) -> None:
+    run(["git", "pull", "--rebase", "origin", branch], root)
+
+
 def open_streamlit_cloud() -> None:
     url = "https://share.streamlit.io/"
     print(f"Opening Streamlit Community Cloud: {url}")
@@ -88,10 +103,17 @@ def main() -> int:
         ensure_branch(root, args.branch)
         ensure_remote(root, args.repo)
         commit_if_needed(root, args.commit_message)
-        push(root, args.branch)
+        try:
+            push(root, args.branch)
+        except RuntimeError as exc:
+            if not _is_non_fast_forward(exc):
+                raise
+            print("Push rejected (remote ahead). Rebasing local branch and retrying...")
+            sync_branch(root, args.branch)
+            push(root, args.branch)
     except RuntimeError as exc:
         print(f"\nDeploy helper failed: {exc}", file=sys.stderr)
-        print("Tip: if push fails, authenticate with GitHub in your terminal and rerun.", file=sys.stderr)
+        print("Tip: if push fails, ensure GitHub auth is valid and resolve any rebase conflicts, then rerun.", file=sys.stderr)
         return 1
 
     print("\nGitHub push completed.")
