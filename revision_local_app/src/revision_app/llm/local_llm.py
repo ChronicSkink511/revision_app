@@ -143,6 +143,168 @@ class LocalLLMClient:
         except Exception:
             return None
 
+    def _clean_text_line(self, text: str) -> str:
+        cleaned = text.strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"^[\-•·\*]+\s*", "", cleaned)
+        cleaned = re.sub(r"\s+([,.;:?!])", r"\1", cleaned)
+        return cleaned.strip(" -")
+
+    def _is_noise_line(self, text: str) -> bool:
+        lower = text.lower()
+
+        if self._is_generic_filler(text):
+            return True
+
+        noise_patterns = [
+            r"\b(email|office|room|lecture\s*\d+|source:|reference\s*no\.?|dr\.?\s|prof\.?\s)\b",
+            r"\b\d{1,2}\s+[a-z]{3,9}\s+\d{4}\b",
+            r"\b\d+\s*/\s*\d+\b",
+            r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b",
+            r"^\d+[)\].:]?$",
+        ]
+        if any(re.search(pattern, lower) for pattern in noise_patterns):
+            return True
+
+        if len(text) < 25:
+            return True
+
+        if text.count("?") > 1:
+            return True
+
+        return False
+
+    def _normalize_fact(self, text: str, max_len: int = 180) -> str:
+        fact = self._clean_text_line(text)
+        if len(fact) > max_len:
+            fact = fact[: max_len - 1].rsplit(" ", 1)[0] + "..."
+        return fact
+
+    def _format_notes_from_facts(self, facts: list[str]) -> str:
+        if not facts:
+            return "- No notes generated from the provided material."
+        return "\n".join(f"- {fact}" for fact in facts[:8])
+
+    def _sanitize_generated_notes(self, response: str, topic: str, context: str) -> str:
+        blocked_tokens = {
+            "quiz",
+            "multiple choice",
+            "short-answer",
+            "short answer",
+            "answers to student",
+            "query",
+        }
+
+        context_tokens = {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{4,}", context)}
+        lines = [self._clean_text_line(line) for line in response.splitlines()]
+        bullets: list[str] = []
+        seen: set[str] = set()
+
+        for line in lines:
+            if not line:
+                continue
+            lowered = line.lower()
+            if any(token in lowered for token in blocked_tokens):
+                continue
+            if self._is_noise_line(line):
+                continue
+
+            if re.match(r"^\d+[\).]\s*", line):
+                line = re.sub(r"^\d+[\).]\s*", "", line)
+
+            line_tokens = {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{4,}", line)}
+            if line_tokens and context_tokens:
+                overlap = len(line_tokens.intersection(context_tokens)) / max(len(line_tokens), 1)
+                if overlap < 0.35:
+                    continue
+
+            norm = re.sub(r"\W+", "", line.lower())
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            bullets.append(line)
+
+        if len(bullets) < 3:
+            facts = self._extract_topic_facts(topic, context, max_facts=10)
+            return self._format_notes_from_facts(facts)
+
+        return "\n".join(f"- {item}" for item in bullets[:8])
+
+    def _is_response_grounded(self, response: str, context: str, min_overlap: float = 0.42) -> bool:
+        response_tokens = {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{4,}", response)}
+        context_tokens = {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{4,}", context)}
+
+        if not response_tokens or not context_tokens:
+            return False
+
+        overlap = response_tokens.intersection(context_tokens)
+        ratio = len(overlap) / max(len(response_tokens), 1)
+        return ratio >= min_overlap
+
+    def _extract_topic_facts(self, topic: str, context: str, max_facts: int = 14) -> list[str]:
+        raw_parts = re.split(r"(?<=[.!?])\s+|\n+", context.strip())
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        for part in raw_parts:
+            cleaned = self._clean_text_line(part)
+            if not cleaned:
+                continue
+            if self._is_noise_line(cleaned):
+                continue
+
+            normalized_key = re.sub(r"\W+", "", cleaned.lower())
+            if normalized_key in seen:
+                continue
+            seen.add(normalized_key)
+            candidates.append(cleaned)
+
+        if not candidates:
+            return []
+
+        scored = [(self._score_sentence_relevance(item, topic), item) for item in candidates]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        facts = [self._normalize_fact(item) for score, item in scored if score > 0][:max_facts]
+        return facts
+
+    def _make_distractor(self, fact: str, topic: str, variant: int) -> str:
+        replacements = [
+            (r"\bcompressible\b", "incompressible"),
+            (r"\bincompressible\b", "compressible"),
+            (r"\bincrease(s|d)?\b", "decrease"),
+            (r"\bdecrease(s|d)?\b", "increase"),
+            (r"\bhigh\b", "low"),
+            (r"\blow\b", "high"),
+            (r"\badiabatic\b", "isothermal"),
+            (r"\bisothermal\b", "adiabatic"),
+            (r"\brequired\b", "optional"),
+            (r"\bimportant\b", "negligible"),
+        ]
+
+        for idx in range(variant, len(replacements) + variant):
+            pattern, replacement = replacements[idx % len(replacements)]
+            if re.search(pattern, fact, flags=re.IGNORECASE):
+                mutated = re.sub(pattern, replacement, fact, count=1, flags=re.IGNORECASE)
+                if mutated != fact:
+                    return mutated
+
+        fallback_distractors = [
+            f"This statement is not supported by the provided material about {topic}.",
+            f"The notes do not state this relationship for {topic}.",
+            f"This claim contradicts the key points shown for {topic}.",
+            f"This option describes a different topic, not {topic}.",
+        ]
+        return fallback_distractors[variant % len(fallback_distractors)]
+
+    def _note_question_from_fact(self, topic: str, fact: str) -> str:
+        if re.search(r"\b(is|are|refers to|defined as)\b", fact.lower()):
+            return f"Which statement correctly defines a concept in {topic}?"
+        if re.search(r"\b(causes|results|leads to|due to|because)\b", fact.lower()):
+            return f"Which cause-and-effect statement about {topic} is supported by the notes?"
+        if re.search(r"\b(equation|formula|=)\b", fact.lower()):
+            return f"Which statement about formulas in {topic} is correct?"
+        return f"According to the provided material, which statement about {topic} is correct?"
+
     def _generate(self, user_prompt: str, max_tokens: int | None = None) -> str:
         if self._generation_failures >= self._max_generation_failures:
             return ""
@@ -199,16 +361,9 @@ class LocalLLMClient:
         return []
 
     def generate_notes(self, topic: str, context: str) -> str:
-        prompt = (
-            "Write concise revision notes in 6-10 bullet points with formulas when present. "
-            f"Topic: {topic}\nContext:\n{context[:3500]}"
-        )
-        response = self._generate(prompt, max_tokens=280)
-        if response:
-            return response
-
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", context) if s.strip()]
-        return "\n".join(f"- {s}" for s in sentences[:8]) or "- No notes generated."
+        # Use strictly source-grounded notes to avoid malformed or hallucinated bullets.
+        facts = self._extract_topic_facts(topic, context, max_facts=10)
+        return self._format_notes_from_facts(facts)
 
     def _is_generic_filler(self, text: str) -> bool:
         """Check if text is generic filler vs meaningful content."""
@@ -278,18 +433,24 @@ class LocalLLMClient:
 
     def _extract_content_sentences(self, context: str, max_sentences: int = 20) -> list[str]:
         """Extract and rank sentences by relevance for quiz generation."""
-        sentences = re.split(r'(?<=[.!?])\s+', context.strip())
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 15 and len(s.strip()) < 300]
-        
-        # For now, just filter out generic filler
-        filtered = [s for s in sentences if not self._is_generic_filler(s)]
-        return filtered if filtered else sentences[:max_sentences]
+        sentences = re.split(r'(?<=[.!?])\s+|\n+', context.strip())
+        cleaned: list[str] = []
+        for sentence in sentences:
+            item = self._clean_text_line(sentence)
+            if not item:
+                continue
+            if len(item) > 300:
+                item = item[:299]
+            if self._is_noise_line(item):
+                continue
+            cleaned.append(item)
+        return cleaned[:max_sentences]
 
     def _build_content_based_quiz(self, topic: str, context: str, total_questions: int) -> dict:
         """Build quiz questions directly from document content instead of LLM generation."""
-        sentences = self._extract_content_sentences(context, max_sentences=25)
-        
-        if not sentences:
+        facts = self._extract_topic_facts(topic, context, max_facts=14)
+
+        if not facts:
             # Ultimate fallback - at least include topic name meaningfully
             return {
                 "mcq": [
@@ -309,68 +470,54 @@ class LocalLLMClient:
                     for _ in range(min(2, total_questions - 3))
                 ],
             }
-        
-        # Score all sentences by relevance to topic
-        scored_sentences = [(self._score_sentence_relevance(s, topic), i, s) for i, s in enumerate(sentences)]
-        scored_sentences.sort(reverse=True)  # Sort by relevance score descending
-        top_sentences = [s for _, _, s in scored_sentences]
-        
+
         mcq_count = max(3, min(6, total_questions - 2))
         short_answer_count = total_questions - mcq_count
-        
-        # Create MCQ from top-scoring sentences
+
+        selected_facts = facts[:max(mcq_count + 3, 6)]
+
         mcq_list = []
-        used_indices = set()
-        
-        for idx in range(min(mcq_count, len(top_sentences))):
-            question_source = top_sentences[idx]
-            used_indices.add(idx)
-            
-            # Create a question from the sentence
-            if len(question_source) > 60:
-                question = question_source[:100] + "?"
-                if not question.endswith("?"):
-                    question = question.rsplit(" ", 1)[0] + "?"
-            else:
-                question = f"Which describes {topic}: {question_source[:50]}?"
-            
-            # Gather other high-relevance sentences as distractors
-            other_sentences = [
-                top_sentences[j][:100] 
-                for j in range(len(top_sentences)) 
-                if j not in used_indices and j < idx + 5
-            ][:3]
-            
-            options = [question_source[:100]]
-            options.extend(other_sentences)
+
+        for idx in range(mcq_count):
+            fact = selected_facts[idx % len(selected_facts)]
+            question = self._note_question_from_fact(topic, fact)
+
+            distractors = [self._make_distractor(fact, topic, idx + off) for off in (1, 2, 3, 4, 5)]
+            options: list[str] = []
+            for candidate in [fact] + distractors:
+                if candidate not in options:
+                    options.append(candidate)
+                if len(options) == 4:
+                    break
+
             while len(options) < 4:
-                # Add conceptually related but different options
-                other_topics = [
-                    f"A related but different aspect of engineering",
-                    f"A common misconception about {topic}",
-                    f"An opposite or contrasting principle"
+                misconceptions = [
+                    f"{topic} assumes fluid density remains constant in all conditions.",
+                    f"{topic} applies only to low-speed flows with negligible temperature change.",
+                    f"{topic} ignores the relationship between pressure, temperature, and density.",
+                    f"{topic} is not relevant to engineering gas-flow devices.",
                 ]
-                options.extend(other_topics)
-            options = options[:4]
-            
+                extra = misconceptions[len(options) % len(misconceptions)]
+                if extra not in options:
+                    options.append(extra)
+
             mcq_list.append({
                 "question": question,
                 "options": options,
-                "answer": options[0],
-                "explanation": f"This is directly stated in the course material about {topic}.",
+                "answer": fact,
+                "explanation": "The correct option is explicitly supported by the provided source material.",
             })
-        
-        # Create short answer from top-ranking sentences
+
         short_answer_list = []
-        guide_sentences = top_sentences[:min(4, len(top_sentences))]
-        answer_guide = " ".join(guide_sentences)[:400] if guide_sentences else f"Focus on key aspects of {topic}"
-        
+        guide_facts = selected_facts[:min(5, len(selected_facts))]
+        answer_guide = " ".join(guide_facts)[:420] if guide_facts else f"Focus on key aspects of {topic}."
+
         for i in range(short_answer_count):
             short_answer_list.append({
-                "question": f"Explain the key concepts of {topic}.",
-                "answer_guide": answer_guide or f"Use specific examples and definitions from the material.",
+                "question": f"Explain one key principle of {topic} and why it matters in engineering practice.",
+                "answer_guide": answer_guide,
             })
-        
+
         return {
             "mcq": mcq_list,
             "short_answer": short_answer_list,
